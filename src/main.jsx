@@ -48,7 +48,7 @@ async function findLabelCrop(page) {
   if (pageWidth <= 5.5 * 72 && pageHeight <= 7 * 72) {
     scan.width = 1;
     scan.height = 1;
-    return { x: 0, y: 0, width: pageWidth, height: pageHeight, pageWidth, pageHeight };
+    return { x: 0, y: 0, width: pageWidth, height: pageHeight, pageWidth, pageHeight, view: page.view };
   }
   const cropH = Math.min(5 * 72, pageHeight);
   const cropW = Math.min(cropH * LABEL_WIDTH / LABEL_HEIGHT, pageWidth);
@@ -68,37 +68,47 @@ async function findLabelCrop(page) {
   const y = top / 0.6;
   scan.width = 1;
   scan.height = 1;
-  return { x, y, width: cropW, height: cropH, pageWidth, pageHeight };
+  return { x, y, width: cropW, height: cropH, pageWidth, pageHeight, view: page.view };
 }
 
-async function renderOutputPage(pdf, sourcePage, crop, output) {
-  const page = await pdf.getPage(sourcePage);
-  const viewport = page.getViewport({ scale: EXPORT_DPI / 72 });
-  const canvas = document.createElement('canvas');
-  canvas.width = Math.ceil(viewport.width);
-  canvas.height = Math.ceil(viewport.height);
-  await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+async function looksLikeFlipkartLabelPdf(pdf) {
+  // Check a few opening pages so an unrelated PDF is rejected before we create
+  // a downloadable file. Flipkart's print contains AWB and shipping fields plus
+  // seller, item, or dispatch markers in the top label panel.
+  for (let pageNo = 1; pageNo <= Math.min(pdf.numPages, 3); pageNo++) {
+    const page = await pdf.getPage(pageNo);
+    const pageTop = page.view[3];
+    const topPanelStart = pageTop - 5.4 * 72;
+    const content = await page.getTextContent();
+    const labelText = content.items
+      .filter(item => item.str?.trim() && item.transform?.[5] >= topPanelStart)
+      .map(item => item.str)
+      .join(' ')
+      .toLowerCase();
 
-  const scale = EXPORT_DPI / 72;
-  const left = Math.max(0, Math.min(canvas.width - 1, Math.round(crop.x * scale)));
-  const top = Math.max(0, Math.min(canvas.height - 1, Math.round(crop.y * scale)));
-  const width = Math.max(1, Math.min(canvas.width - left, Math.round(crop.width * scale)));
-  const height = Math.max(1, Math.min(canvas.height - top, Math.round(crop.height * scale)));
-  const cut = document.createElement('canvas');
-  cut.width = width;
-  cut.height = height;
-  cut.getContext('2d').drawImage(canvas, left, top, width, height, 0, 0, width, height);
-
-  const png = await new Promise((resolve, reject) => cut.toBlob(blob => blob ? resolve(blob) : reject(new Error('Could not render a label page.')), 'image/png'));
-  const image = await output.embedPng(await png.arrayBuffer());
-  const outPage = output.addPage([LABEL_WIDTH * 72, LABEL_HEIGHT * 72]);
-  outPage.drawImage(image, { x: 0, y: 0, width: LABEL_WIDTH * 72, height: LABEL_HEIGHT * 72 });
-  canvas.width = 1;
-  canvas.height = 1;
-  cut.width = 1;
-  cut.height = 1;
+    const hasTracking = /\bawb\b|air\s*way\s*bill|tracking\s*(?:id|no\.?|number)|shipment\s*(?:id|no\.?)/i.test(labelText);
+    const markerGroups = [
+      /shipping\s*\/\s*customer\s*address|shipping\s+address|ship\s+to|delivery\s+address/i,
+      /flipkart|sku\s*id|sold\s+by|seller|gstin|ordered\s+through/i,
+      /\bhbd\b|\bcpd\b|\bcod\b/i,
+    ];
+    const markerCount = markerGroups.filter(pattern => pattern.test(labelText)).length;
+    if (hasTracking && markerCount >= 2) return true;
+  }
+  return false;
 }
 
+async function addCroppedPdfPage(sourcePdf, sourcePage, crop, output) {
+  // Keep the original PDF objects; changing page boxes crops the vector content
+  // without converting text, barcodes, or graphics into a bitmap.
+  const [outPage] = await output.copyPages(sourcePdf, [sourcePage - 1]);
+  const [xMin, yMin] = crop.view;
+  const boxX = xMin + crop.x;
+  const boxY = yMin + crop.pageHeight - crop.y - crop.height;
+  outPage.setMediaBox(boxX, boxY, crop.width, crop.height);
+  outPage.setCropBox(boxX, boxY, crop.width, crop.height);
+  output.addPage(outPage);
+}
 function App() {
   const inputRef = useRef(null);
   const [isDragOver, setIsDragOver] = useState(false);
@@ -116,12 +126,18 @@ function App() {
     setBusy(true); setProgress(0); setResult(null); setMessage('Reading PDF…'); setFileName(file.name);
     try {
       const source = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+      setMessage('Checking for a Flipkart shipping label…');
+      if (!(await looksLikeFlipkartLabelPdf(source))) {
+        setMessage('This PDF doesn’t look like a supported Flipkart label print. Please upload the Flipkart label PDF, not an invoice or unrelated document.');
+        return;
+      }
       const output = await PDFDocument.create();
+      const editableSource = await PDFDocument.load(await file.arrayBuffer());
       for (let i = 1; i <= source.numPages; i++) {
         setMessage(`Finding label ${i} of ${source.numPages}…`);
         const page = await source.getPage(i);
         const crop = await findLabelCrop(page);
-        await renderOutputPage(source, i, crop, output);
+        await addCroppedPdfPage(editableSource, i, crop, output);
         setProgress(Math.round((i / source.numPages) * 100));
       }
       const bytes = await output.save();
