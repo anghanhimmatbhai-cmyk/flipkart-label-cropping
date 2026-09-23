@@ -151,7 +151,7 @@ function App() {
       <section className="how"><div className="how-heading"><span>MADE FOR QUICK SHIPPING</span><h2>From print file to label file.</h2></div><div className="steps"><article><div className="step-icon">01</div><div><h3>Upload your PDF</h3><p>Single page or a whole batch of labels.</p></div></article><article><div className="step-icon green">✦</div><div><h3>We find the top label</h3><p>Each page is cropped automatically.</p></div></article><article><div className="step-icon">↓</div><div><h3>Download and print</h3><p>One label per 4.1 × 6 inch PDF page.</p></div></article></div></section>
       <div className="privacy"><span>⌑</span> Your PDF is processed locally in your browser. It is never uploaded to a server.</div>
     </main>
-    <footer><span>labelflow<span className="brand-dot">.</span></span><span>Made for a smoother shipping day</span></footer>
+    <footer><span>labelflow<span className="brand-dot">.</span></span><span>Created by Bhaudip Anghan</span><span>Made for a smoother shipping day</span></footer>
   </div>;
 }
 
