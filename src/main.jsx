@@ -7,68 +7,66 @@ import './style.css';
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
 
-const LABEL_WIDTH = 4.1;
+const LABEL_WIDTH = 4;
 const LABEL_HEIGHT = 6;
+const PAGE_MARGIN_PX = 40;
 const EXPORT_DPI = 203;
 
-function makeInkIntegral(canvas) {
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  const { width, height } = canvas;
-  const data = ctx.getImageData(0, 0, width, height).data;
-  const stride = width + 1;
-  const sums = new Uint32Array((width + 1) * (height + 1));
-  for (let y = 1; y <= height; y++) {
-    let row = 0;
-    for (let x = 1; x <= width; x++) {
-      const at = ((y - 1) * width + x - 1) * 4;
-      const lightness = (data[at] * 3 + data[at + 1] * 6 + data[at + 2]) / 10;
-      if (lightness < 238) row++;
-      sums[y * stride + x] = sums[(y - 1) * stride + x] + row;
-    }
-  }
-  return (x, y, w, h) => {
-    const x2 = x + w, y2 = y + h;
-    return sums[y2 * stride + x2] - sums[y * stride + x2] - sums[y2 * stride + x] + sums[y * stride + x];
-  };
+function makeDownloadFileName(pageCount, date = new Date()) {
+  const pad = value => String(value).padStart(2, '0');
+  const timeData = `${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}${pad(date.getMonth() + 1)}${pad(date.getDate())}${String(date.getFullYear()).slice(-2)}`;
+  return `flipkart_lables_${pageCount}_${timeData}.pdf`;
 }
 
-// Flipkart's A4 invoice print places the shipping label in a centered top panel.
-// Keep the crop anchored at the page top so the score cannot drift into the invoice.
+// Use the shipping label's AWB and address text as anchors. Ink-density scanning
+// can select dense invoice content elsewhere on the page.
 async function findLabelCrop(page) {
-  const viewport = page.getViewport({ scale: 0.6 });
-  const scan = document.createElement('canvas');
-  scan.width = Math.ceil(viewport.width);
-  scan.height = Math.ceil(viewport.height);
-  await page.render({ canvasContext: scan.getContext('2d'), viewport }).promise;
-
-  const pageWidth = viewport.width / 0.6;
-  const pageHeight = viewport.height / 0.6;
-  // Preserve PDFs that are already label-sized. On the A4 Flipkart template the
-  // label panel is centered at about 4.1 in across and runs from y=.41 to y=5.28 in.
+  const [viewLeft, viewBottom, viewRight, viewTop] = page.view;
+  const pageWidth = viewRight - viewLeft;
+  const pageHeight = viewTop - viewBottom;
   if (pageWidth <= 5.5 * 72 && pageHeight <= 7 * 72) {
-    scan.width = 1;
-    scan.height = 1;
     return { x: 0, y: 0, width: pageWidth, height: pageHeight, pageWidth, pageHeight, view: page.view };
   }
-  const cropH = Math.min(5 * 72, pageHeight);
-  const cropW = Math.min(cropH * LABEL_WIDTH / LABEL_HEIGHT, pageWidth);
-  const winW = Math.max(1, Math.min(scan.width, Math.round(cropW * 0.6)));
-  const winH = Math.max(1, Math.min(scan.height, Math.round(cropH * 0.6)));
-  const maxX = Math.max(0, scan.width - winW);
-  const top = Math.min(Math.round(0.34 * 72 * 0.6), Math.max(0, scan.height - winH));
-  const inkIn = makeInkIntegral(scan);
-  let best = null;
-  for (let x = 0; x <= maxX; x += 2) {
-    const ink = inkIn(x, top, winW, winH);
-    const centerBias = Math.abs((x + winW / 2) - scan.width / 2) * 0.015;
-    const score = ink - centerBias;
-    if (!best || score > best.score) best = { x, score };
+
+  const items = (await page.getTextContent()).items.filter(item => item.str?.trim() && item.transform);
+  const awb = items.find(item => /\bawb\b|air\s*way\s*bill|tracking\s*(?:id|no\.?|number)/i.test(item.str));
+  const address = items.find(item => /shipping\s*\/\s*customer\s*address|shipping\s+address|ship\s+to|delivery\s+address/i.test(item.str));
+  if (!awb || !address) {
+    throw new Error('Could not locate the shipping label AWB and address on this page. No crop was made.');
   }
-  const x = best ? best.x / 0.6 : Math.max(0, (pageWidth - cropW) / 2);
-  const y = top / 0.6;
-  scan.width = 1;
-  scan.height = 1;
-  return { x, y, width: cropW, height: cropH, pageWidth, pageHeight, view: page.view };
+
+  const itemCenterX = item => item.transform[4] + (item.width || 0) / 2;
+  const labelCenterX = (itemCenterX(awb) + itemCenterX(address)) / 2;
+  const separator = items.find(item => /not\s+for\s+resale/i.test(item.str));
+  const minimumBaseline = separator
+    ? separator.transform[5] - 1
+    : viewTop - 5 * 72;
+  const labelItems = items.filter(item => {
+    const baseline = item.transform[5];
+    return baseline >= minimumBaseline
+      && baseline <= viewTop
+      && Math.abs(itemCenterX(item) - labelCenterX) <= 2.05 * 72;
+  });
+  if (labelItems.length < 8) {
+    throw new Error('Could not isolate the shipping label from the invoice. No crop was made.');
+  }
+
+  const leftRightPadding = 4;
+  const topPadding = 3;
+  const bottomPadding = 8;
+  const left = Math.max(viewLeft, Math.min(...labelItems.map(item => item.transform[4])) - leftRightPadding);
+  const right = Math.min(viewRight, Math.max(...labelItems.map(item => item.transform[4] + (item.width || 0))) + leftRightPadding);
+  const bottom = Math.max(viewBottom, Math.min(...labelItems.map(item => item.transform[5])) - bottomPadding);
+  const top = Math.min(viewTop, Math.max(...labelItems.map(item => item.transform[5] + (item.height || 0))) + topPadding);
+  return {
+    x: left - viewLeft,
+    y: viewTop - top,
+    width: right - left,
+    height: top - bottom,
+    pageWidth,
+    pageHeight,
+    view: page.view,
+  };
 }
 
 async function looksLikeFlipkartLabelPdf(pdf) {
@@ -99,15 +97,26 @@ async function looksLikeFlipkartLabelPdf(pdf) {
 }
 
 async function addCroppedPdfPage(sourcePdf, sourcePage, crop, output) {
-  // Keep the original PDF objects; changing page boxes crops the vector content
-  // without converting text, barcodes, or graphics into a bitmap.
   const [outPage] = await output.copyPages(sourcePdf, [sourcePage - 1]);
   const [xMin, yMin] = crop.view;
   const boxX = xMin + crop.x;
   const boxY = yMin + crop.pageHeight - crop.y - crop.height;
-  outPage.setMediaBox(boxX, boxY, crop.width, crop.height);
-  outPage.setCropBox(boxX, boxY, crop.width, crop.height);
-  output.addPage(outPage);
+  const croppedLabel = await output.embedPage(outPage, {
+    left: boxX,
+    bottom: boxY,
+    right: boxX + crop.width,
+    top: boxY + crop.height,
+  });
+  const pageWidth = LABEL_WIDTH * 72;
+  const pageHeight = LABEL_HEIGHT * 72;
+  const margin = PAGE_MARGIN_PX * 72 / EXPORT_DPI;
+  const page = output.addPage([pageWidth, pageHeight]);
+  page.drawPage(croppedLabel, {
+    x: margin,
+    y: margin,
+    width: pageWidth - margin * 2,
+    height: pageHeight - margin * 2,
+  });
 }
 function App() {
   const inputRef = useRef(null);
@@ -142,7 +151,7 @@ function App() {
       }
       const bytes = await output.save();
       const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
-      setResult({ url, pages: source.numPages, name: file.name.replace(/\.pdf$/i, '') || 'labels' });
+      setResult({ url, pages: source.numPages, downloadName: makeDownloadFileName(source.numPages) });
       setMessage('Your cropped labels are ready.');
     } catch (error) {
       console.error(error);
@@ -160,11 +169,11 @@ function App() {
       <section className={`drop-card ${isDragOver ? 'drop-active' : ''} ${busy ? 'is-busy' : ''}`} onDragOver={event => {event.preventDefault();setIsDragOver(true)}} onDragLeave={() => setIsDragOver(false)} onDrop={onDrop}>
         {!busy && !result && <><div className="upload-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v5h14v-5"/></svg></div><h2>Drop your PDF here</h2><p>or choose a file from your device</p><button className="button primary" onClick={() => inputRef.current?.click()}>Choose PDF <span>↑</span></button><div className="file-note">PDF files · Multiple labels supported</div></>}
         {busy && <div className="processing"><div className="spinner"></div><h2>Working through your labels</h2><p>{message}</p><div className="progress-track"><div className="progress-fill" style={{width: `${Math.max(5, progress)}%`}} /></div><div className="progress-caption"><span>Auto-cropping pages</span><span>{progress}%</span></div></div>}
-        {!busy && result && <div className="ready"><div className="ready-icon">✓</div><div className="ready-tag">ALL DONE</div><h2>Your labels are ready.</h2><p><strong>{result.pages} label{result.pages === 1 ? '' : 's'}</strong> cropped from {fileName}</p><a className="button primary download" href={result.url} download={`${result.name}-cropped-4.1x6.pdf`}>Download cropped PDF <span>↓</span></a><button className="button text-button" onClick={() => {setResult(null);setMessage('');inputRef.current?.click()}}>Crop another PDF</button></div>}
+        {!busy && result && <div className="ready"><div className="ready-icon">✓</div><div className="ready-tag">ALL DONE</div><h2>Your labels are ready.</h2><p><strong>{result.pages} label{result.pages === 1 ? '' : 's'}</strong> cropped from {fileName}</p><a className="button primary download" href={result.url} download={result.downloadName}>Download cropped PDF <span>↓</span></a><button className="button text-button" onClick={() => {setResult(null);setMessage('');inputRef.current?.click()}}>Crop another PDF</button></div>}
         <input ref={inputRef} className="file-input" type="file" accept="application/pdf,.pdf" onChange={onInputChange}/>
       </section>
       {message && !busy && !result && <div className="error-message" role="status">{message}</div>}
-      <section className="how"><div className="how-heading"><span>MADE FOR QUICK SHIPPING</span><h2>From print file to label file.</h2></div><div className="steps"><article><div className="step-icon">01</div><div><h3>Upload your PDF</h3><p>Single page or a whole batch of labels.</p></div></article><article><div className="step-icon green">✦</div><div><h3>We find the top label</h3><p>Each page is cropped automatically.</p></div></article><article><div className="step-icon">↓</div><div><h3>Download and print</h3><p>One label per 4.1 × 6 inch PDF page.</p></div></article></div></section>
+      <section className="how"><div className="how-heading"><span>MADE FOR QUICK SHIPPING</span><h2>From print file to label file.</h2></div><div className="steps"><article><div className="step-icon">01</div><div><h3>Upload your PDF</h3><p>Single page or a whole batch of labels.</p></div></article><article><div className="step-icon green">✦</div><div><h3>We find the top label</h3><p>Each page is cropped automatically.</p></div></article><article><div className="step-icon">↓</div><div><h3>Download and print</h3><p>One label per 4 × 6 inch PDF page.</p></div></article></div></section>
       <div className="privacy"><span>⌑</span> Your PDF is processed locally in your browser. It is never uploaded to a server.</div>
     </main>
     <footer><span>labelflow<span className="brand-dot">.</span></span><span>Created by Bhaudip Anghan</span><span>Made for a smoother shipping day</span></footer>
