@@ -215,7 +215,19 @@ function App() {
       <section className={`drop-card ${isDragOver ? 'drop-active' : ''} ${busy ? 'is-busy' : ''}`} onDragOver={event => {event.preventDefault();setIsDragOver(true)}} onDragLeave={() => setIsDragOver(false)} onDrop={onDrop}>
         {!busy && !result && <><div className="upload-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v5h14v-5"/></svg></div><h2>Drop your PDF here</h2><p>or choose a file from your device</p><button className="button primary" onClick={() => inputRef.current?.click()}>Choose PDF <span>↑</span></button><div className="file-note">PDF files · Multiple labels supported</div></>}
         {busy && <div className="processing"><div className="spinner"></div><h2>{mode === 'amazon' ? 'Keeping your Amazon labels' : 'Working through your labels'}</h2><p>{message}</p><div className="progress-track"><div className="progress-fill" style={{width: `${Math.max(5, progress)}%`}} /></div><div className="progress-caption"><span>{mode === 'amazon' ? 'Removing invoice pages' : 'Auto-cropping pages'}</span><span>{progress}%</span></div></div>}
-        {!busy && result && <div className="ready"><div className="ready-icon">✓</div><div className="ready-tag">ALL DONE</div><h2>Your labels are ready.</h2><p><strong>{result.pages} label{result.pages === 1 ? '' : 's'}</strong> {mode === 'amazon' ? 'kept from' : 'cropped from'} {fileName}</p><a className="button primary download" href={result.url} download={result.downloadName}>Download {mode === 'amazon' ? 'labels' : 'cropped PDF'} <span>↓</span></a><button className="button text-button" onClick={() => {setResult(null);setMessage('');inputRef.current?.click()}}>{mode === 'amazon' ? 'Process another PDF' : 'Crop another PDF'}</button></div>}
+        {!busy && result && <div className="ready"><div className="ready-icon">✓</div><div className="ready-tag">ALL DONE</div><h2>Your labels are ready.</h2><p><strong>{result.pages} label{result.pages === 1 ? '' : 's'}</strong> {mode === 'amazon' ? 'kept from' : 'cropped from'} {fileName}</p><a className="button primary download" href={result.url} download={result.downloadName} onClick={() => {
+          const downloadUrl = result.url;
+          // Give the browser time to start downloading the generated PDF blob.
+          window.setTimeout(() => {
+            setResult(current => {
+              if (current?.url !== downloadUrl) return current;
+              URL.revokeObjectURL(downloadUrl);
+              return null;
+            });
+            setMessage('');
+            setFileName('');
+          }, 1000);
+        }}>Download {mode === 'amazon' ? 'labels' : 'cropped PDF'} <span>↓</span></a><button className="button text-button" onClick={() => {setResult(null);setMessage('');inputRef.current?.click()}}>{mode === 'amazon' ? 'Process another PDF' : 'Crop another PDF'}</button></div>}
         <input ref={inputRef} className="file-input" type="file" accept="application/pdf,.pdf" onChange={onInputChange}/>
       </section>
       {message && !busy && !result && <div className="error-message" role="status">{message}</div>}
